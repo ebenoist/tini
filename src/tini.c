@@ -90,15 +90,17 @@ static int32_t expect_status[(STATUS_MAX - STATUS_MIN + 1) / 32];
 
 #ifdef PR_SET_CHILD_SUBREAPER
 #define HAS_SUBREAPER 1
-#define OPT_STRING "p:hvwgle:s"
+#define OPT_STRING "p:hvwmgle:s"
 #define SUBREAPER_ENV_VAR "TINI_SUBREAPER"
 #else
 #define HAS_SUBREAPER 0
-#define OPT_STRING "p:hvwgle:"
+#define OPT_STRING "p:hvwmgle:"
 #endif
 
 #define VERBOSITY_ENV_VAR "TINI_VERBOSITY"
 #define KILL_PROCESS_GROUP_GROUP_ENV_VAR "TINI_KILL_PROCESS_GROUP"
+#define PREEMPTIVE_MEMORY_LIMITER_ENABLED_ENV_VAR "TINI_PREEMPTIVE_MEMORY_LIMITER_ENABLED"
+#define PREEMPTIVE_MEMORY_LIMITER_THRESHOLD_ENV_VAR "TINI_PREEMPTIVE_MEMORY_LIMITER_THRESHOLD"
 
 #define TINI_VERSION_STRING "tini version " TINI_VERSION TINI_GIT
 
@@ -110,8 +112,12 @@ static unsigned int parent_death_signal = 0;
 static unsigned int kill_process_group = 0;
 
 static unsigned int warn_on_reap = 0;
+static unsigned int preemptive_memory_limiter_enabled = 0;
+static int preemptive_memory_limiter_threshold = 10;
 
 static struct timespec ts = { .tv_sec = 1, .tv_nsec = 0 };
+static const char USAGE_IN_BYTES_SYS[] = "/sys/fs/cgroup/memory/memory.usage_in_bytes";
+static const char LIMIT_IN_BYTES_SYS[] = "/sys/fs/cgroup/memory/memory.limit_in_bytes";
 
 static const char reaper_warning[] = "Tini is not running as PID 1 "
 #if HAS_SUBREAPER
@@ -249,7 +255,9 @@ void print_usage(char* const name, FILE* const file) {
 	fprintf(file, "  -g: Send signals to the child's process group.\n");
 	fprintf(file, "  -e EXIT_CODE: Remap EXIT_CODE (from 0 to 255) to 0.\n");
 	fprintf(file, "  -l: Show license and exit.\n");
+	fprintf(file, "  -m: Enable the preemptive memory limiter. Child process will receive SIGTERM when memory threhsold limit is reached.\n");
 #endif
+
 
 	fprintf(file, "\n");
 
@@ -259,6 +267,8 @@ void print_usage(char* const name, FILE* const file) {
 #endif
 	fprintf(file, "  %s: Set the verbosity level (default: %d).\n", VERBOSITY_ENV_VAR, DEFAULT_VERBOSITY);
 	fprintf(file, "  %s: Send signals to the child's process group.\n", KILL_PROCESS_GROUP_GROUP_ENV_VAR);
+	fprintf(file, "  %s: Set the preemptive memory limiter threshold: 10 percent is the default.\n", PREEMPTIVE_MEMORY_LIMITER_THRESHOLD_ENV_VAR);
+	fprintf(file, "  %s: Enable the preemptive memory limiter\n", PREEMPTIVE_MEMORY_LIMITER_ENABLED_ENV_VAR);
 
 	fprintf(file, "\n");
 }
@@ -340,6 +350,10 @@ int parse_args(const int argc, char* const argv[], char* (**child_args_ptr_ptr)[
 				verbosity++;
 				break;
 
+			case 'm':
+				preemptive_memory_limiter_enabled++;
+				break;
+
 			case 'w':
 				warn_on_reap++;
 				break;
@@ -401,6 +415,15 @@ int parse_env() {
 
 	if (getenv(KILL_PROCESS_GROUP_GROUP_ENV_VAR) != NULL) {
 		kill_process_group++;
+	}
+
+	if (getenv(PREEMPTIVE_MEMORY_LIMITER_ENABLED_ENV_VAR) != NULL) {
+		preemptive_memory_limiter_enabled++;
+	}
+
+	char* env_threshold = getenv(PREEMPTIVE_MEMORY_LIMITER_THRESHOLD_ENV_VAR);
+	if (getenv(PREEMPTIVE_MEMORY_LIMITER_THRESHOLD_ENV_VAR) != NULL) {
+		preemptive_memory_limiter_threshold = atoi(env_threshold);
 	}
 
 	char* env_verbosity = getenv(VERBOSITY_ENV_VAR);
@@ -603,6 +626,60 @@ int reap_zombies(const pid_t child_pid, int* const child_exitcode_ptr) {
 	return 0;
 }
 
+int read_memory_stats(const char* path, long* bytes) {
+	FILE *stats_file;
+
+	stats_file = fopen(path, "r");
+	if (!stats_file) {
+		return 1;
+	}
+
+	if (fscanf(stats_file, "%ld", bytes) != 1) {
+		return 1;
+	}
+
+	if (fclose(stats_file) != 0) {
+		return 1;
+	}
+
+	return 0;
+}
+
+void check_for_memory_pressure(pid_t const child_pid) {
+	if (preemptive_memory_limiter_enabled == 0) {
+		return;
+	}
+
+	long limit_in_bytes, usage_in_bytes;
+	int err;
+	err = read_memory_stats(LIMIT_IN_BYTES_SYS, &limit_in_bytes);
+	if (err != 0) {
+		PRINT_WARNING("[PREEMPTIVE MEMORY LIMITER] Failed to read memory.limit_in_bytes");
+		return;
+	}
+
+	err = read_memory_stats(USAGE_IN_BYTES_SYS, &usage_in_bytes);
+	if (err != 0) {
+		PRINT_WARNING("[PREEMPTIVE MEMORY LIMITER] Failed to read memory.usage_in_bytes");
+		return;
+	}
+
+	PRINT_DEBUG("[PREEMPTIVE MEMORY LIMITER] memory.usage_in_bytes: %ld", usage_in_bytes);
+	PRINT_DEBUG("[PREEMPTIVE MEMORY LIMITER] memory.limit_in_bytes: %ld", limit_in_bytes);
+
+	int prct_exhausted = ((limit_in_bytes - usage_in_bytes) * 100)/limit_in_bytes;
+	if (prct_exhausted < preemptive_memory_limiter_threshold) {
+		PRINT_FATAL("[PREEMPTIVE MEMORY LIMITER] memory usage is beyond the configured buffer, sending SIGTERM.");
+
+		if (kill(kill_process_group ? -child_pid : child_pid, SIGTERM)) {
+			if (errno == ESRCH) {
+					PRINT_WARNING("[PREEMPTIVE MEMORY LIMITER] child process already dead");
+				} else {
+					PRINT_WARNING("[PREEMPTIVE MEMORY LIMITER] could not kill '%s'", strerror(errno));
+			}
+		}
+	}
+}
 
 int main(int argc, char *argv[]) {
 	pid_t child_pid;
@@ -667,6 +744,8 @@ int main(int argc, char *argv[]) {
 		if (wait_and_forward_signal(&parent_sigset, child_pid)) {
 			return 1;
 		}
+
+		check_for_memory_pressure(child_pid);
 
 		/* Now, reap zombies */
 		if (reap_zombies(child_pid, &child_exitcode)) {
