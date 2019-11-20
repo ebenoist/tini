@@ -101,6 +101,7 @@ static int32_t expect_status[(STATUS_MAX - STATUS_MIN + 1) / 32];
 #define KILL_PROCESS_GROUP_GROUP_ENV_VAR "TINI_KILL_PROCESS_GROUP"
 #define PREEMPTIVE_MEMORY_LIMITER_ENABLED_ENV_VAR "TINI_PREEMPTIVE_MEMORY_LIMITER_ENABLED"
 #define PREEMPTIVE_MEMORY_LIMITER_THRESHOLD_ENV_VAR "TINI_PREEMPTIVE_MEMORY_LIMITER_THRESHOLD"
+#define UNSET_LIMIT_IN_BYTES 9223372036854771712
 
 #define TINI_VERSION_STRING "tini version " TINI_VERSION TINI_GIT
 
@@ -667,9 +668,14 @@ void check_for_memory_pressure(pid_t const child_pid) {
 	PRINT_DEBUG("[PREEMPTIVE MEMORY LIMITER] memory.usage_in_bytes: %ld", usage_in_bytes);
 	PRINT_DEBUG("[PREEMPTIVE MEMORY LIMITER] memory.limit_in_bytes: %ld", limit_in_bytes);
 
+	if (limit_in_bytes >= UNSET_LIMIT_IN_BYTES) {
+		PRINT_WARNING("[PREEMPTIVE MEMORY LIMITER] memory.limit_in_bytes is not set");
+		return;
+	}
+
 	int prct_exhausted = ((limit_in_bytes - usage_in_bytes) * 100)/limit_in_bytes;
 	if (prct_exhausted < preemptive_memory_limiter_threshold) {
-		PRINT_FATAL("[PREEMPTIVE MEMORY LIMITER] memory usage is beyond the configured buffer, sending SIGTERM.");
+		PRINT_FATAL("[PREEMPTIVE MEMORY LIMITER] memory usage (%i) is beyond the configured buffer, sending SIGTERM.", prct_exhausted);
 
 		if (kill(kill_process_group ? -child_pid : child_pid, SIGTERM)) {
 			if (errno == ESRCH) {
